@@ -1,8 +1,9 @@
 import os
-import json
+import time
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from google.genai.errors import ServerError
 import tools
 
 load_dotenv()
@@ -11,10 +12,8 @@ API_KEY = os.getenv("GEMINI_API_KEY")
 if not API_KEY or API_KEY == "your_gemini_api_key_here":
     raise ValueError("GEMINI_API_KEY is not configured in .env.")
 
-# Initialize client
 client = genai.Client(api_key=API_KEY)
 
-# Tool Dispatch Table
 TOOL_MAP = {
     "calculate_expression": tools.calculate_expression,
     "read_system_metric": tools.read_system_metric,
@@ -27,12 +26,26 @@ Deconstruct user objectives into discrete steps, invoke registered tools sequent
 observe their execution output, and synthesize a final concise status summary.
 """
 
+def generate_with_retry(contents, config, model_name="gemini-3.5-flash", max_retries=4):
+    for attempt in range(1, max_retries + 1):
+        try:
+            return client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=config
+            )
+        except ServerError as e:
+            if attempt == max_retries:
+                raise
+            sleep_sec = attempt * 3
+            print(f"    [!] 503 High Demand notice (Attempt {attempt}/{max_retries}). Retrying in {sleep_sec}s...")
+            time.sleep(sleep_sec)
+
 def execute_agent_loop(user_goal: str, model_name: str = "gemini-3.5-flash", max_iterations: int = 6):
     print("=" * 70)
     print(f"[*] NEW GOAL: {user_goal}")
     print("=" * 70)
 
-    # Initialize conversational state
     contents = [
         types.Content(
             role="user",
@@ -45,34 +58,26 @@ def execute_agent_loop(user_goal: str, model_name: str = "gemini-3.5-flash", max
     while iteration < max_iterations:
         iteration += 1
         print(f"\n--- [AGENT CYCLE {iteration}] ---")
-        
-        # Sense & Plan: Call model with tool definitions
+
         config = types.GenerateContentConfig(
             system_instruction=SYSTEM_INSTRUCTION,
             temperature=0.0,
             tools=tools.AGENT_TOOLS
         )
-        
-        response = client.models.generate_content(
-            model=model_name,
-            contents=contents,
-            config=config
-        )
+
+        response = generate_with_retry(contents, config, model_name=model_name)
 
         candidate = response.candidates[0]
         model_content = candidate.content
         contents.append(model_content)
 
-        # Check for function calls
         function_calls = response.function_calls
 
         if not function_calls:
-            # No tool requested -> Task finished
             print("\n[+] FINAL AGENT SYNTHESIS:")
             print(response.text)
             return response.text
 
-        # Act: Execute tool calls locally
         response_parts = []
         for call in function_calls:
             fn_name = call.name
@@ -86,7 +91,6 @@ def execute_agent_loop(user_goal: str, model_name: str = "gemini-3.5-flash", max
 
             print(f"[+] LOCAL OBSERVATION -> Result: {tool_output}")
 
-            # Format tool result as an observation back to the LLM
             response_parts.append(
                 types.Part.from_function_response(
                     name=fn_name,
@@ -94,7 +98,6 @@ def execute_agent_loop(user_goal: str, model_name: str = "gemini-3.5-flash", max
                 )
             )
 
-        # Feed observations back into the context window
         contents.append(
             types.Content(
                 role="user",
